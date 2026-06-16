@@ -1,0 +1,5 @@
+catalog_v1.parquet
+outlier_cv_out*/
+outlier_cv_results*.tar.gz
+*.json
+__pycache__/
