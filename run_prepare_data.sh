@@ -38,9 +38,14 @@ if [ ! -f "$KEY" ]; then
   echo "[run]          put sciserver-uploader.json here or set GCS_KEY=/path/to/key.json"
 fi
 
-# 3) run. SHARDS=a-b runs that contiguous range in sequence; otherwise pass --shard yourself.
+# 3) run. --smoke benchmarks sizes 16/24/32/64 (no shard, no upload);
+#    SHARDS=a-b runs that contiguous range in sequence; otherwise pass --shard yourself.
 status=0
-if [ -n "${SHARDS:-}" ]; then
+if [[ "$*" == *--smoke* ]]; then
+  echo "[run] smoke benchmark (no upload)"
+  "$PY" prepare_data.py --catalog "$CATALOG" --key "$KEY" "$@"
+  status=$?
+elif [ -n "${SHARDS:-}" ]; then
   lo="${SHARDS%-*}"; hi="${SHARDS#*-}"
   echo "[run] building shards $lo..$hi in sequence"
   for s in $(seq "$lo" "$hi"); do

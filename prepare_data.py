@@ -111,6 +111,60 @@ def load_catalog(path, key):
     return pd.read_parquet(path)
 
 
+def smoke(args):
+    """Benchmark per-frame cutting cost at stamp sizes 16/24/32/64 on the first
+    `--corp` frames. Single-process (so the number IS the per-frame cost); the
+    real build divides wall-clock by --workers. Cuts but never uploads."""
+    SIZES = (16, 24, 32, 64)
+    BYTES = {"float16": 2, "float32": 4}[args.dtype]
+
+    df = load_catalog(args.catalog, args.key)
+    df = df.sort_values("idx").reset_index(drop=True)
+    n_gal = len(df)
+    n_frames_total = df.groupby(["run", "camcol", "field"]).ngroups
+    print(f"[smoke] catalog: {n_gal:,} galaxies in {n_frames_total:,} frames; "
+          f"SAS={args.sas}  dtype={args.dtype}  workers(real build)={args.workers}")
+
+    # first --corp frames (contiguous in build order = realistic frame locality)
+    groups = []
+    for (r, c, f), g in df.groupby(["run", "camcol", "field"], sort=False):
+        groups.append((int(r), int(c), int(f),
+                       list(zip(g.idx.astype(int), g.ra.astype(float), g.dec.astype(float)))))
+        if len(groups) >= args.corp:
+            break
+    n_smoke_gal = sum(len(g[3]) for g in groups)
+    print(f"[smoke] timing {len(groups)} frames ({n_smoke_gal:,} galaxies) at each size\n")
+    print(f"  {'size':>4} | {'s/frame':>8} | {'frames/s':>8} | {'gal/s':>7} | {'miss':>5} | "
+          f"{'full build (1 proc)':>19} | {f'wall @{args.workers}w':>11} | {'dataset GB':>10}")
+    print("  " + "-" * 96)
+
+    for size in SIZES:
+        _init(size, args.dtype, args.sas)        # set globals used by cut_group
+        miss = ncut = 0
+        t0 = time.time()
+        for grp in groups:
+            for _idx, stamp in cut_group(grp):
+                if stamp is None:
+                    miss += 1
+                else:
+                    ncut += 1
+        el = time.time() - t0
+        spf = el / max(len(groups), 1)
+        fps = len(groups) / el if el else 0.0
+        gps = n_smoke_gal / el if el else 0.0
+        full_1proc_h = n_frames_total * spf / 3600
+        wall_h = full_1proc_h / max(args.workers, 1)
+        ds_gb = n_gal * size * size * len(BANDS) * BYTES / 1e9
+        print(f"  {size:>4} | {spf:>8.3f} | {fps:>8.1f} | {gps:>7.1f} | {miss:>5} | "
+              f"{full_1proc_h:>16.1f} h | {wall_h:>9.1f} h | {ds_gb:>8.1f} GB")
+
+    if miss == n_smoke_gal:                       # every cut missed -> bad SAS mount
+        print(f"\n[smoke] WARNING: ALL stamps missed — the SAS mount '{args.sas}' is almost "
+              f"certainly wrong (no frames found there). Fix --sas before a real run.")
+    print(f"\n[smoke] full build = {n_frames_total:,} frames; 'wall @{args.workers}w' assumes "
+          f"perfect {args.workers}-way scaling (real is a bit less). No data uploaded.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -120,7 +174,11 @@ def main():
                     help="sciserver-uploader service-account JSON (for GCS upload)")
     ap.add_argument("--of", type=int, default=64, dest="n_shards",
                     help="total number of contiguous shards (default 64)")
-    ap.add_argument("--shard", type=int, required=True, help="which shard (0..of-1)")
+    ap.add_argument("--shard", type=int, default=None, help="which shard (0..of-1); not needed with --smoke")
+    ap.add_argument("--smoke", action="store_true",
+                    help="benchmark cutting speed at sizes 16/24/32/64 on a few frames, no upload")
+    ap.add_argument("--corp", type=int, default=20,
+                    help="--smoke only: how many frames to sample for the timing (default 20)")
     ap.add_argument("--size", type=int, default=64, help="stamp size px (default 64)")
     ap.add_argument("--dtype", default="float16", choices=["float16", "float32"],
                     help="stored pixel dtype (default float16, half the bytes)")
@@ -133,6 +191,12 @@ def main():
     ap.add_argument("--tmp", default="/tmp", help="where to write the shard before upload")
     ap.add_argument("--force", action="store_true", help="rebuild even if output exists")
     args = ap.parse_args()
+
+    if args.smoke:
+        smoke(args)
+        return
+
+    assert args.shard is not None, "--shard is required (or use --smoke)"
     assert 0 <= args.shard < args.n_shards, "shard out of range"
 
     # NB: workers get the SAS mount via the Pool initializer (_init); main
