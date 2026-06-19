@@ -117,57 +117,44 @@ def load_catalog(path, key):
 
 
 def smoke(args):
-    """Benchmark per-frame cutting cost at stamp sizes 16/24/32/64 on the first
-    `--corp` frames. Single-process (so the number IS the per-frame cost); the
-    real build divides wall-clock by --workers. Cuts but never uploads."""
-    SIZES = (16, 24, 32, 64)
-    BYTES = {"float16": 2, "float32": 4}[args.dtype]
-
+    """End-to-end sanity check: cut the first `--corp` galaxies (default 3) and
+    confirm each stamp comes out with the right shape/dtype, finite, and not
+    empty. No timing, no upload — just proves the pipeline runs against the SAS
+    mount. A MISS or all-zero stamp means the SAS path / frames are wrong."""
     df = load_catalog(args.catalog, args.key)
     df = df.sort_values("idx").reset_index(drop=True)
-    n_gal = len(df)
-    n_frames_total = df.groupby(["run", "camcol", "field"]).ngroups
-    print(f"[smoke] catalog: {n_gal:,} galaxies in {n_frames_total:,} frames; "
-          f"SAS={args.sas}  dtype={args.dtype}  workers(real build)={args.workers}")
+    sub = df.head(max(args.corp, 1))
+    o2id = dict(zip(sub.idx.astype(int), sub.objid.astype(int)))
+    print(f"[smoke] cutting {len(sub)} galaxies at {args.size}px from SAS={args.sas} "
+          f"(dtype={args.dtype}) — no upload\n")
 
-    # first --corp frames (contiguous in build order = realistic frame locality)
-    groups = []
-    for (r, c, f), g in df.groupby(["run", "camcol", "field"], sort=False):
-        groups.append((int(r), int(c), int(f),
-                       list(zip(g.idx.astype(int), g.ra.astype(float), g.dec.astype(float)))))
-        if len(groups) >= args.corp:
-            break
-    n_smoke_gal = sum(len(g[3]) for g in groups)
-    print(f"[smoke] timing {len(groups)} frames ({n_smoke_gal:,} galaxies) at each size\n")
-    print(f"  {'size':>4} | {'s/frame':>8} | {'frames/s':>8} | {'gal/s':>7} | {'miss':>5} | "
-          f"{'full build (1 proc)':>19} | {f'wall @{args.workers}w':>11} | {'dataset GB':>10}")
-    print("  " + "-" * 96)
+    groups = [(int(r), int(c), int(f),
+               list(zip(g.idx.astype(int), g.ra.astype(float), g.dec.astype(float))))
+              for (r, c, f), g in sub.groupby(["run", "camcol", "field"])]
+    _init(args.size, args.dtype, args.sas)        # set globals used by cut_group
 
-    for size in SIZES:
-        _init(size, args.dtype, args.sas)        # set globals used by cut_group
-        miss = ncut = 0
-        t0 = time.time()
-        for grp in groups:
-            for _idx, stamp in cut_group(grp):
-                if stamp is None:
-                    miss += 1
-                else:
-                    ncut += 1
-        el = time.time() - t0
-        spf = el / max(len(groups), 1)
-        fps = len(groups) / el if el else 0.0
-        gps = n_smoke_gal / el if el else 0.0
-        full_1proc_h = n_frames_total * spf / 3600
-        wall_h = full_1proc_h / max(args.workers, 1)
-        ds_gb = n_gal * size * size * len(BANDS) * BYTES / 1e9
-        print(f"  {size:>4} | {spf:>8.3f} | {fps:>8.1f} | {gps:>7.1f} | {miss:>5} | "
-              f"{full_1proc_h:>16.1f} h | {wall_h:>9.1f} h | {ds_gb:>8.1f} GB")
+    ok = 0
+    for grp in groups:
+        for idx, stamp in cut_group(grp):
+            oid = o2id.get(idx)
+            if stamp is None:
+                print(f"  objid {oid} (idx {idx}): MISS — no/broken frame or off-frame")
+                continue
+            f32 = stamp.astype("float32")
+            finite = bool(np.isfinite(f32).all())
+            p99 = [float(np.percentile(f32[:, :, b], 99)) for b in range(len(BANDS))]
+            nonempty = any(p > 0 for p in p99)
+            good = finite and nonempty
+            ok += good
+            print(f"  objid {oid} (idx {idx}): shape {stamp.shape} {stamp.dtype}  "
+                  f"finite={finite}  p99(ugriz)=[{', '.join(f'{p:.3f}' for p in p99)}]  "
+                  f"{'OK' if good else 'BAD (empty/non-finite)'}")
 
-    if miss == n_smoke_gal:                       # every cut missed -> bad SAS mount
-        print(f"\n[smoke] WARNING: ALL stamps missed — the SAS mount '{args.sas}' is almost "
-              f"certainly wrong (no frames found there). Fix --sas before a real run.")
-    print(f"\n[smoke] full build = {n_frames_total:,} frames; 'wall @{args.workers}w' assumes "
-          f"perfect {args.workers}-way scaling (real is a bit less). No data uploaded.")
+    print(f"\n[smoke] {ok}/{len(sub)} stamps OK — e2e {'PASSED' if ok == len(sub) else 'FAILED'}.")
+    if ok < len(sub):
+        print(f"[smoke] check --sas ('{args.sas}'); in a Compute Job it's usually "
+              f"'/home/idies/workspace/SDSS SAS' (with a space).")
+        raise SystemExit(1)
 
 
 def main():
@@ -182,9 +169,9 @@ def main():
                     help="total number of contiguous shards (default 64)")
     ap.add_argument("--shard", type=int, default=None, help="which shard (0..of-1); not needed with --smoke")
     ap.add_argument("--smoke", action="store_true",
-                    help="benchmark cutting speed at sizes 16/24/32/64 on a few frames, no upload")
-    ap.add_argument("--corp", type=int, default=20,
-                    help="--smoke only: how many frames to sample for the timing (default 20)")
+                    help="e2e sanity check: cut a few galaxies, verify the stamps, no upload")
+    ap.add_argument("--corp", type=int, default=3,
+                    help="--smoke only: how many galaxies to cut for the check (default 3)")
     ap.add_argument("--size", type=int, default=64, help="stamp size px (default 64)")
     ap.add_argument("--dtype", default="float16", choices=["float16", "float32"],
                     help="stored pixel dtype (default float16, half the bytes)")

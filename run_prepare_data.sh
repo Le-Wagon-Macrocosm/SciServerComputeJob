@@ -38,11 +38,11 @@ if [ ! -f "$KEY" ]; then
   echo "[run]          put sciserver-uploader.json here or set GCS_KEY=/path/to/key.json"
 fi
 
-# 3) run. --smoke benchmarks sizes 16/24/32/64 (no shard, no upload);
+# 3) run. --smoke cuts a few galaxies to verify e2e (no shard, no upload);
 #    SHARDS=a-b runs that contiguous range in sequence; otherwise pass --shard yourself.
 status=0
 if [[ "$*" == *--smoke* ]]; then
-  echo "[run] smoke benchmark (no upload)"
+  echo "[run] smoke e2e check (no upload)"
   "$PY" prepare_data.py --catalog "$CATALOG" --key "$KEY" "$@"
   status=$?
 elif [ -n "${SHARDS:-}" ]; then
