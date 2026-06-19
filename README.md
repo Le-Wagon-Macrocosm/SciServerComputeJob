@@ -23,10 +23,11 @@ frame (decompresses just the first bz2 block, never the 12 MB of pixels). Writes
 unique frames are split into **18 fragments** (`--fragment 0-17`), each writing
 `frame_offset_<NN>.csv`, so it can run as one job or several disjoint jobs.
 ```bash
-bash run_task_a.sh --fragment 0-17 --sas "/home/idies/workspace/SDSS SAS" --workers 32   # all in one
+bash run_task_a.sh --fragment 0-17 --workers 32      # all in one (SAS default /home/idies/workspace/sdss_sas)
 # or split across jobs:  --fragment 0-5  |  --fragment 6-11  |  --fragment 12-17
 python merge_offsets.py     # frame_offset_*.csv -> frame_offset.csv (dedup + coverage check)
 ```
+`objid_frame.csv` is created on first run and reused if present.
 `frame_offset.csv` columns: `run,camcol,field, u_dx,u_dy, g_dx,g_dy, r_dx,r_dy, i_dx,i_dy, z_dx,z_dy`
 (u is 0,0 — it was the cut reference; the 4 real shifts are g/r/i/z).
 

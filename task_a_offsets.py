@@ -137,9 +137,11 @@ def main():
         cpath = local
     cat = pd.read_parquet(cpath, columns=["idx", "objid", "run", "camcol", "field"]).sort_values("idx")
 
-    # --- A1: objid -> frame (written once, by the fragment-0 job) ---
-    if 0 in frags:
-        f1 = os.path.join(args.out_dir, "objid_frame.csv")
+    # --- A1: objid -> frame (create once; if it already exists, reuse it) ---
+    f1 = os.path.join(args.out_dir, "objid_frame.csv")
+    if os.path.exists(f1):
+        print(f"[A1] {f1} exists — reuse", flush=True)
+    else:
         cat.to_csv(f1, index=False)
         print(f"[A1] wrote {f1}  ({len(cat):,} galaxies)", flush=True)
 

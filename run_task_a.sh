@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Task A — per-frame band-registration offsets (header-only, reads the mounted SAS).
-# Split into 18 fragments; run all in one job, or disjoint fragments as separate jobs:
-#   bash run_task_a.sh --fragment 0-17 --sas "/home/idies/workspace/SDSS SAS" --workers 32
-#   bash run_task_a.sh --fragment 0-5  --sas "/home/idies/workspace/SDSS SAS"   # one job's share
+# Split into 18 fragments; run all in one job, or disjoint fragments as separate jobs.
+# SAS default = /home/idies/workspace/sdss_sas (pass --sas only if your mount differs):
+#   bash run_task_a.sh --fragment 0-17 --workers 32
+#   bash run_task_a.sh --fragment 0-5                 # one job's share
 # Then merge:  python merge_offsets.py
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; cd "$HERE"
