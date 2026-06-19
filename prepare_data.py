@@ -46,6 +46,11 @@ SAS = "/home/idies/workspace/sdss_sas"
 BANDS = "ugriz"
 RERUN = 301
 
+# defaults: the project catalog on GCS, and the SA key sitting next to this script
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CATALOG = "gs://macrocosm-lewagon/data/sample_v1/catalog_v1.parquet"
+DEFAULT_KEY = os.path.join(HERE, "sciserver-uploader.json")
+
 
 def frame_path(run, camcol, field, band):
     return (f"{SAS}/dr17/eboss/photoObj/frames/{RERUN}/{run}/{camcol}/"
@@ -168,10 +173,11 @@ def smoke(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--catalog", required=True,
-                    help="catalog_v1.parquet (local path or gs://...)")
-    ap.add_argument("--key", required=True,
-                    help="sciserver-uploader service-account JSON (for GCS upload)")
+    ap.add_argument("--catalog", default=DEFAULT_CATALOG,
+                    help=f"catalog_v1.parquet (local path or gs://...; default {DEFAULT_CATALOG})")
+    ap.add_argument("--key", default=DEFAULT_KEY,
+                    help=f"sciserver-uploader service-account JSON for GCS upload "
+                         f"(default: sciserver-uploader.json next to this script)")
     ap.add_argument("--of", type=int, default=64, dest="n_shards",
                     help="total number of contiguous shards (default 64)")
     ap.add_argument("--shard", type=int, default=None, help="which shard (0..of-1); not needed with --smoke")
