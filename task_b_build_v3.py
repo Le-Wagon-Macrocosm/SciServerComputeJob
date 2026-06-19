@@ -9,7 +9,7 @@ so the crop is unaffected), and upload the result to sample_v3.
     python task_b_build_v3.py --shard 0-99 \
         --offsets frame_offset.csv --catalog objid_frame.csv --workers 32
 """
-import os, argparse, subprocess, tempfile, time
+import os, argparse, tempfile, time
 import numpy as np, pandas as pd
 from multiprocessing import Pool
 from scipy.ndimage import shift as nshift
@@ -20,6 +20,12 @@ OFF = (SIZE - CROP) // 2          # 20
 SHARD_N = 100
 SRC = "gs://macrocosm-lewagon/data/sample_v1"
 DST = "gs://macrocosm-lewagon/data/sample_v3"
+
+
+# gcloud/gsutil aren't on SciServer -> use the google-cloud-storage lib with the SA key.
+def _blob(client, uri):
+    bkt, name = uri[5:].split("/", 1)
+    return client.bucket(bkt).blob(name)
 
 
 def parse_shards(spec, n):
@@ -64,11 +70,16 @@ def main():
     ap.add_argument("--catalog", default="objid_frame.csv",
                     help="Task A objid_frame.csv (idx,objid,run,camcol,field), idx-sorted")
     ap.add_argument("--workers", type=int, default=32)
+    ap.add_argument("--key", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                  "sciserver-uploader.json"),
+                    help="SA key JSON for GCS (default: sciserver-uploader.json beside this script)")
     ap.add_argument("--src", default=SRC)
     ap.add_argument("--dst", default=DST)
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
+    from google.cloud import storage
+    client = storage.Client.from_service_account_json(args.key)
     shards = parse_shards(args.shard, SHARD_N)
     cat = pd.read_csv(args.catalog).sort_values("idx").reset_index(drop=True)
     n = len(cat); block = (n + SHARD_N - 1) // SHARD_N
@@ -82,13 +93,13 @@ def main():
         if start >= end:
             continue
         name = f"images_{start:07d}_{end:07d}.npy"
-        if not args.force and subprocess.run(["gsutil", "-q", "stat", f"{args.dst}/{name}"]).returncode == 0:
+        if not args.force and _blob(client, f"{args.dst}/{name}").exists():
             print(f"[shard {sh}] {args.dst}/{name} exists — skip", flush=True)
             continue
 
         t0 = time.time()
         local = os.path.join(tempfile.gettempdir(), f"v1_{sh}.npy")
-        subprocess.run(["gsutil", "-q", "cp", f"{args.src}/{name}", local], check=True)
+        _blob(client, f"{args.src}/{name}").download_to_filename(local)
 
         sub = cat.iloc[start:end]
         m = sub.merge(off_df, on=["run", "camcol", "field"], how="left")
@@ -107,7 +118,7 @@ def main():
 
         dst_local = os.path.join(tempfile.gettempdir(), name)
         np.save(dst_local, out)
-        subprocess.run(["gsutil", "-q", "cp", dst_local, f"{args.dst}/{name}"], check=True)
+        _blob(client, f"{args.dst}/{name}").upload_from_filename(dst_local)
         os.remove(local); os.remove(dst_local)
         print(f"[shard {sh}] {ng:,} imgs -> {CROP}x{CROP} ({nmiss} no-offset) "
               f"in {time.time()-t0:.0f}s -> {args.dst}/{name}", flush=True)

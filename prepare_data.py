@@ -202,7 +202,7 @@ def build_shard(args, shard, bucket, df, n):
 
     out = np.zeros((end - start, args.size, args.size, len(BANDS)), dtype=args.dtype)
     done = miss = 0
-    t0 = time.time()
+    t0 = last = time.time()
     with Pool(args.workers, initializer=_init, initargs=(args.size, args.dtype, args.sas)) as pool:
         for res in pool.imap_unordered(cut_group, groups, chunksize=1):
             for idx, stamp in res:
@@ -211,14 +211,16 @@ def build_shard(args, shard, bucket, df, n):
                     continue
                 out[idx - start] = stamp
             done += 1
-            # heartbeat: first 10 frames individually (catch a slow/stalled mount
-            # immediately), then every 50. flush so it shows up in the job log live.
-            if done <= 10 or done % 50 == 0:
-                el = time.time() - t0
-                eta = (len(groups) - done) / (done / el) / 60 if el and done else 0
+            # heartbeat: first frame (confirm it's alive) + every 30s. flush so it
+            # shows up live in the job log (block-buffered when stdout is a file).
+            now = time.time()
+            if done == 1 or now - last >= 30:
+                last = now
+                el = now - t0
+                rate = done / el if el else 0
+                eta = (len(groups) - done) / rate / 60 if rate else 0
                 print(f"[shard {shard}]   {done:,}/{len(groups):,} frames  "
-                      f"{el:.0f}s  {done / el:.2f} frames/s  ~{eta:.0f} min left",
-                      flush=True)
+                      f"{el:.0f}s  {rate:.2f} frames/s  ~{eta:.0f} min left", flush=True)
     el = time.time() - t0
     ng = end - start
     print(f"[shard {shard}] cut {ng:,} galaxies from {len(groups):,} frames "

@@ -124,13 +124,16 @@ def main():
     args = ap.parse_args()
     frags = parse_list(args.fragment, N_FRAGMENTS)
 
-    # catalog (local path or gs://)
+    # catalog (local path or gs://). gcloud/gsutil aren't on SciServer -> use the
+    # google-cloud-storage lib with the SA key (same as prepare_data.py).
     cpath = args.catalog
     if cpath.startswith("gs://"):
-        import subprocess, tempfile
+        import tempfile
+        from google.cloud import storage
         local = os.path.join(tempfile.gettempdir(), "catalog_v1.parquet")
         if not os.path.exists(local):
-            subprocess.run(["gcloud", "storage", "cp", cpath, local], check=True)
+            bkt, blob = cpath[5:].split("/", 1)
+            storage.Client.from_service_account_json(args.key).bucket(bkt).blob(blob).download_to_filename(local)
         cpath = local
     cat = pd.read_parquet(cpath, columns=["idx", "objid", "run", "camcol", "field"]).sort_values("idx")
 
