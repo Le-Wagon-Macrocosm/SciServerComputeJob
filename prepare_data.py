@@ -211,10 +211,14 @@ def build_shard(args, shard, bucket, df, n):
                     continue
                 out[idx - start] = stamp
             done += 1
-            if done % 200 == 0:
+            # heartbeat: first 10 frames individually (catch a slow/stalled mount
+            # immediately), then every 50. flush so it shows up in the job log live.
+            if done <= 10 or done % 50 == 0:
                 el = time.time() - t0
-                print(f"[shard {shard}]   {done:,}/{len(groups):,} frames "
-                      f"({el:.0f}s, {done / el:.1f} frames/s)")
+                eta = (len(groups) - done) / (done / el) / 60 if el and done else 0
+                print(f"[shard {shard}]   {done:,}/{len(groups):,} frames  "
+                      f"{el:.0f}s  {done / el:.2f} frames/s  ~{eta:.0f} min left",
+                      flush=True)
     el = time.time() - t0
     ng = end - start
     print(f"[shard {shard}] cut {ng:,} galaxies from {len(groups):,} frames "
