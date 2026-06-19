@@ -1,9 +1,39 @@
 # SciServer Compute Jobs — Macrocosm photo-z
 
-SciServer batch jobs for the **Macrocosm** photo-z project. Two jobs live here:
+SciServer batch jobs for the **Macrocosm** photo-z project. Jobs here:
 
 1. **Image-stamp build** (`prepare_data.py`) — cut the ugriz cutouts from the SDSS frames.
-2. **Outlier CV** (`outlier_cv_job.py`) — 5-fold CV on the tabular catalog to find the hard set.
+2. **v1 → v3 registration** (`task_a_offsets.py` + `task_b_build_v3.py`) — fix the sample_v1
+   band misregistration cheaply (no re-cut) and crop to 24×24.
+3. **Outlier CV** (`outlier_cv_job.py`) — 5-fold CV on the tabular catalog to find the hard set.
+
+---
+
+## v1 → v3 registration (fix misregistration without re-cutting)
+
+`sample_v1` cut every band at the **u-band** WCS pixel, so g/r/i/z are offset from the galaxy
+by the inter-band astrometry (3–13 px). Instead of re-downloading/re-cutting 6.5 TB of frames,
+we reuse v1's pixels and just **shift each band by the known per-frame offset**, then crop the
+centre 24×24. Validated against a correctly re-cut shard: corr 0.93–0.98 (per-frame offset),
+residual ~0.5–1 px.
+
+**Task A — `task_a_offsets.py`** (SciServer, SAS mounted): reads ONLY the FITS header of each
+frame (decompresses just the first bz2 block, never the 12 MB of pixels) and writes
+`objid_frame.csv` (idx,objid,run,camcol,field) + `frame_offset.csv` (run,camcol,field + per-band
+dx,dy at frame centre). ~259k unique frames; header-only, so cheap on SAS.
+```bash
+bash run_task_a.sh --sas "/home/idies/workspace/SDSS SAS" --workers 32
+```
+
+**Task B — `task_b_build_v3.py`** (GCS): per shard, pull v1 from `sample_v1`, look up each
+galaxy's offset, sub-pixel shift every channel, crop centre 24×24, upload to `sample_v3`.
+```bash
+bash run_task_b.sh --shard 0-99 --workers 32     # needs Task A's two CSVs + gsutil auth
+```
+Output: `gs://macrocosm-lewagon/data/sample_v3/images_*.npy`, each `(6000, 24, 24, 5)` float16,
+same shard layout / catalog alignment as v1.
+
+---
 
 Designed for the **SciServer Compute Job — Large Jobs Domain** (32 cores, 240 GB), with the
 SDSS DR17 SAS data volume mounted (needed for the image build).
