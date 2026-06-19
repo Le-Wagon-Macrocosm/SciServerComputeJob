@@ -9,9 +9,10 @@ server and only the final stamps leave SciServer.
 Sharding (so the 892k build can run across several runners / Compute Jobs):
     --of K        split the catalog into K CONTIGUOUS blocks (preserves the
                   run/camcol/field ordering, so each shard reuses its own frames)
-    --shard i     build block i only  (0 <= i < K)
-Run one process per `i`. Disjoint shards => no coordination. Idempotent: a shard
-whose output already exists on GCS is skipped (rerun a failed `i` freely).
+    --shard i     build block(s) i. Accepts a single '5', a range '0-7', a
+                  list '0,3,5', or a mix '0-3,8' (0 <= i < K), built in sequence.
+Run several processes / Compute Jobs over disjoint shard sets => no coordination.
+Idempotent: a shard whose output already exists on GCS is skipped (rerun freely).
 
 Inside one shard, work is parallelised over (run, camcol, field) groups: each
 group opens its 5 band frames once and cuts every galaxy that lands on them.
@@ -157,6 +158,87 @@ def smoke(args):
         raise SystemExit(1)
 
 
+def parse_shards(spec, n_shards):
+    """'5' -> [5];  '0-7' -> [0..7];  '0,3,5' -> [0,3,5];  '0-3,8' -> [0,1,2,3,8].
+    De-duplicated, sorted, and range-checked against n_shards."""
+    out = []
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            a, b = tok.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(tok))
+    shards = sorted(set(out))
+    assert shards, f"no shards parsed from {spec!r}"
+    for s in shards:
+        assert 0 <= s < n_shards, f"shard {s} out of range [0, {n_shards})"
+    return shards
+
+
+def build_shard(args, shard, bucket, df, n):
+    """Cut + upload one shard's contiguous block. Skips if the output exists
+    (unless --force). Returns silently when there's nothing to do."""
+    block = (n + args.n_shards - 1) // args.n_shards
+    start, end = shard * block, min((shard + 1) * block, n)
+    if start >= end:
+        print(f"[shard {shard}] empty (n={n}, of={args.n_shards}) — nothing to do")
+        return
+    blob_name = f"{args.prefix}/images_{start:07d}_{end:07d}.npy"
+
+    if not args.force and bucket.blob(blob_name).exists():
+        print(f"[shard {shard}] gs://{args.bucket}/{blob_name} exists — skip "
+              f"(use --force to rebuild)")
+        return
+
+    sub = df.iloc[start:end]
+    groups = [(int(r), int(c), int(f),
+               list(zip(g.idx.astype(int), g.ra.astype(float), g.dec.astype(float))))
+              for (r, c, f), g in sub.groupby(["run", "camcol", "field"])]
+    print(f"[shard {shard}] rows {start:,}..{end:,} ({end - start:,} galaxies), "
+          f"{len(groups):,} frames, {args.workers} workers, {args.size}px {args.dtype}")
+
+    out = np.zeros((end - start, args.size, args.size, len(BANDS)), dtype=args.dtype)
+    done = miss = 0
+    t0 = time.time()
+    with Pool(args.workers, initializer=_init, initargs=(args.size, args.dtype, args.sas)) as pool:
+        for res in pool.imap_unordered(cut_group, groups, chunksize=1):
+            for idx, stamp in res:
+                if stamp is None:
+                    miss += 1
+                    continue
+                out[idx - start] = stamp
+            done += 1
+            if done % 200 == 0:
+                el = time.time() - t0
+                print(f"[shard {shard}]   {done:,}/{len(groups):,} frames "
+                      f"({el:.0f}s, {done / el:.1f} frames/s)")
+    el = time.time() - t0
+    ng = end - start
+    print(f"[shard {shard}] cut {ng:,} galaxies from {len(groups):,} frames "
+          f"in {el:.0f}s ({ng / el:.1f} gal/s, {len(groups) / el:.1f} frames/s)")
+    if miss:
+        print(f"[shard {shard}] WARNING: {miss} galaxies had a missing/broken "
+              f"frame -> zero-filled stamps")
+    # safety: a wrong SAS mount makes EVERY frame open fail -> all-zero garbage.
+    # Refuse to upload that; fail loudly so the path gets fixed instead.
+    if miss > 0.2 * ng:
+        raise SystemExit(
+            f"[shard {shard}] ABORTING — {miss}/{ng} galaxies had missing frames. "
+            f"The SAS mount '{args.sas}' is almost certainly wrong (no frames found there). "
+            f"Not uploading all-zero data. Verify with --smoke, fix --sas, rerun.")
+
+    local = os.path.join(args.tmp, os.path.basename(blob_name))
+    np.save(local, out)
+    gb = out.nbytes / 1e9
+    print(f"[shard {shard}] uploading {gb:.2f} GB -> gs://{args.bucket}/{blob_name}")
+    bucket.blob(blob_name).upload_from_filename(local)
+    os.remove(local)
+    print(f"[shard {shard}] done.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -167,7 +249,9 @@ def main():
                          f"(default: sciserver-uploader.json next to this script)")
     ap.add_argument("--of", type=int, default=64, dest="n_shards",
                     help="total number of contiguous shards (default 64)")
-    ap.add_argument("--shard", type=int, default=None, help="which shard (0..of-1); not needed with --smoke")
+    ap.add_argument("--shard", default=None,
+                    help="which shard(s) (0..of-1): a single '5', a range '0-7', a list "
+                         "'0,3,5', or a mix '0-3,8,10-11'. Not needed with --smoke")
     ap.add_argument("--smoke", action="store_true",
                     help="e2e sanity check: cut a few galaxies, verify the stamps, no upload")
     ap.add_argument("--corp", type=int, default=3,
@@ -190,7 +274,7 @@ def main():
         return
 
     assert args.shard is not None, "--shard is required (or use --smoke)"
-    assert 0 <= args.shard < args.n_shards, "shard out of range"
+    shards = parse_shards(args.shard, args.n_shards)
 
     # NB: workers get the SAS mount via the Pool initializer (_init); main
     # itself never calls frame_path, so no module-global mutation is needed here.
@@ -201,68 +285,11 @@ def main():
     df = load_catalog(args.catalog, args.key)
     df = df.sort_values("idx").reset_index(drop=True)
     n = len(df)
-    print(f"[shard {args.shard}] catalog has {n:,} galaxies total")
+    print(f"catalog has {n:,} galaxies; building shard(s) {shards} of {args.n_shards} "
+          f"-> gs://{args.bucket}/{args.prefix}/")
 
-    # contiguous block for this shard
-    size = (n + args.n_shards - 1) // args.n_shards
-    start, end = args.shard * size, min((args.shard + 1) * size, n)
-    if start >= end:
-        print(f"[shard {args.shard}] empty (n={n}, of={args.n_shards}) — nothing to do")
-        return
-    blob_name = f"{args.prefix}/images_{start:07d}_{end:07d}.npy"
-
-    if not args.force and bucket.blob(blob_name).exists():
-        print(f"[shard {args.shard}] gs://{args.bucket}/{blob_name} exists — skip "
-              f"(use --force to rebuild)")
-        return
-
-    sub = df.iloc[start:end]
-    groups = [(int(r), int(c), int(f),
-               list(zip(g.idx.astype(int), g.ra.astype(float), g.dec.astype(float))))
-              for (r, c, f), g in sub.groupby(["run", "camcol", "field"])]
-    print(f"[shard {args.shard}] rows {start:,}..{end:,} ({end - start:,} galaxies), "
-          f"{len(groups):,} frames, {args.workers} workers, {args.size}px {args.dtype}")
-
-    out = np.zeros((end - start, args.size, args.size, len(BANDS)), dtype=args.dtype)
-    done = miss = 0
-    t0 = time.time()
-    with Pool(args.workers, initializer=_init, initargs=(args.size, args.dtype, args.sas)) as pool:
-        for res in pool.imap_unordered(cut_group, groups, chunksize=1):
-            for idx, stamp in res:
-                if stamp is None:
-                    miss += 1
-                    continue
-                out[idx - start] = stamp
-            done += 1
-            if done % 200 == 0:
-                el = time.time() - t0
-                print(f"[shard {args.shard}]   {done:,}/{len(groups):,} frames "
-                      f"({el:.0f}s, {done / el:.1f} frames/s)")
-    el = time.time() - t0
-    ng = end - start
-    print(f"[shard {args.shard}] cut {ng:,} galaxies from {len(groups):,} frames "
-          f"in {el:.0f}s ({ng / el:.1f} gal/s, {len(groups) / el:.1f} frames/s)")
-    # full-build projection at this rate, on this one container:
-    print(f"[shard {args.shard}] => full {n:,} galaxies ≈ "
-          f"{n / (ng / el) / 3600:.1f} h on one container at this rate")
-    if miss:
-        print(f"[shard {args.shard}] WARNING: {miss} galaxies had a missing/broken "
-              f"frame -> zero-filled stamps")
-    # safety: a wrong SAS mount makes EVERY frame open fail -> all-zero garbage.
-    # Refuse to upload that; fail loudly so the path gets fixed instead.
-    if miss > 0.2 * ng:
-        raise SystemExit(
-            f"[shard {args.shard}] ABORTING — {miss}/{ng} galaxies had missing frames. "
-            f"The SAS mount '{args.sas}' is almost certainly wrong (no frames found there). "
-            f"Not uploading all-zero data. Probe with scripts/check_sas.py, fix --sas, rerun.")
-
-    local = os.path.join(args.tmp, os.path.basename(blob_name))
-    np.save(local, out)
-    gb = out.nbytes / 1e9
-    print(f"[shard {args.shard}] uploading {gb:.2f} GB -> gs://{args.bucket}/{blob_name}")
-    bucket.blob(blob_name).upload_from_filename(local)
-    os.remove(local)
-    print(f"[shard {args.shard}] done.")
+    for s in shards:
+        build_shard(args, s, bucket, df, n)
 
 
 if __name__ == "__main__":

@@ -30,9 +30,13 @@ unchanged (idx alignment preserved → reuse `catalog_v1.parquet`).
 # one shard (0..of-1):
 bash run_prepare_data.sh --of 64 --shard 0 --sas "/home/idies/workspace/SDSS SAS"
 
-# a contiguous range in one container, in sequence:
-SHARDS=0-7 bash run_prepare_data.sh --of 64 --sas "/home/idies/workspace/SDSS SAS"
+# multiple shards in one container (range / list / mix), built in sequence:
+bash run_prepare_data.sh --of 64 --shard 0-7      --sas "/home/idies/workspace/SDSS SAS"
+bash run_prepare_data.sh --of 64 --shard 0,3,5    --sas "/home/idies/workspace/SDSS SAS"
+SHARDS=0-7 bash run_prepare_data.sh --of 64       --sas "/home/idies/workspace/SDSS SAS"   # SHARDS env == --shard
 ```
+`--shard` takes a single `5`, a range `0-7`, a list `0,3,5`, or a mix `0-3,8,10-11`.
+Run **several Compute Jobs over disjoint shard sets** to parallelise across containers.
 Put `sciserver-uploader.json` next to the scripts (or set `GCS_KEY=/path/to/key.json`). In a
 Compute Job the SDSS volume mounts with a space, so pass `--sas "/home/idies/workspace/SDSS SAS"`
 (the interactive default is `/home/idies/workspace/sdss_sas`).

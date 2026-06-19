@@ -39,24 +39,17 @@ if [ ! -f "$KEY" ]; then
 fi
 
 # 3) run. --smoke cuts a few galaxies to verify e2e (no shard, no upload);
-#    SHARDS=a-b runs that contiguous range in sequence; otherwise pass --shard yourself.
+#    SHARDS='0-7' (or '0,3,5', '0-3,8') is a convenience for --shard; otherwise pass --shard yourself.
 status=0
 if [[ "$*" == *--smoke* ]]; then
   echo "[run] smoke e2e check (no upload)"
   "$PY" prepare_data.py --catalog "$CATALOG" --key "$KEY" "$@"
-  status=$?
-elif [ -n "${SHARDS:-}" ]; then
-  lo="${SHARDS%-*}"; hi="${SHARDS#*-}"
-  echo "[run] building shards $lo..$hi in sequence"
-  for s in $(seq "$lo" "$hi"); do
-    echo "[run] === shard $s ==="
-    "$PY" prepare_data.py --catalog "$CATALOG" --key "$KEY" --shard "$s" "$@"
-    rc=$?; [ "$rc" -ne 0 ] && status=$rc && echo "[run] shard $s exited $rc"
-  done
 else
-  "$PY" prepare_data.py --catalog "$CATALOG" --key "$KEY" "$@"
-  status=$?
+  EXTRA=()
+  [ -n "${SHARDS:-}" ] && EXTRA=(--shard "$SHARDS")    # SHARDS env -> --shard
+  "$PY" prepare_data.py --catalog "$CATALOG" --key "$KEY" "${EXTRA[@]}" "$@"
 fi
+status=$?
 
 echo "[run] exit=$status"
 exit $status
