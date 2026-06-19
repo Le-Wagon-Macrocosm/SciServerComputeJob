@@ -18,12 +18,17 @@ centre 24×24. Validated against a correctly re-cut shard: corr 0.93–0.98 (per
 residual ~0.5–1 px.
 
 **Task A — `task_a_offsets.py`** (SciServer, SAS mounted): reads ONLY the FITS header of each
-frame (decompresses just the first bz2 block, never the 12 MB of pixels) and writes
-`objid_frame.csv` (idx,objid,run,camcol,field) + `frame_offset.csv` (run,camcol,field + per-band
-dx,dy at frame centre). ~259k unique frames; header-only, so cheap on SAS.
+frame (decompresses just the first bz2 block, never the 12 MB of pixels). Writes `objid_frame.csv`
+(idx,objid,run,camcol,field, by the fragment-0 job) and per-band dx,dy at frame centre. The ~259k
+unique frames are split into **18 fragments** (`--fragment 0-17`), each writing
+`frame_offset_<NN>.csv`, so it can run as one job or several disjoint jobs.
 ```bash
-bash run_task_a.sh --sas "/home/idies/workspace/SDSS SAS" --workers 32
+bash run_task_a.sh --fragment 0-17 --sas "/home/idies/workspace/SDSS SAS" --workers 32   # all in one
+# or split across jobs:  --fragment 0-5  |  --fragment 6-11  |  --fragment 12-17
+python merge_offsets.py     # frame_offset_*.csv -> frame_offset.csv (dedup + coverage check)
 ```
+`frame_offset.csv` columns: `run,camcol,field, u_dx,u_dy, g_dx,g_dy, r_dx,r_dy, i_dx,i_dy, z_dx,z_dy`
+(u is 0,0 — it was the cut reference; the 4 real shifts are g/r/i/z).
 
 **Task B — `task_b_build_v3.py`** (GCS): per shard, pull v1 from `sample_v1`, look up each
 galaxy's offset, sub-pixel shift every channel, crop centre 24×24, upload to `sample_v3`.

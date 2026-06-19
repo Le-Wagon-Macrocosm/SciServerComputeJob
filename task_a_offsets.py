@@ -89,6 +89,26 @@ def frame_offsets(key):
     return key, shifts, res
 
 
+N_FRAGMENTS = 18
+COLS = ["run", "camcol", "field"] + [f"{b}_{d}" for b in BANDS for d in ("dx", "dy")]
+
+
+def parse_list(spec, n):
+    """'0' -> [0];  '3-5' -> [3,4,5];  '0,3' -> [0,3];  '0-17' -> all. Range-checked."""
+    out = []
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            a, b = tok.split("-", 1); out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(tok))
+    s = sorted(set(out))
+    assert s and all(0 <= x < n for x in s), f"bad fragment spec {spec!r} (0..{n-1})"
+    return s
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -96,9 +116,13 @@ def main():
     ap.add_argument("--key", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "sciserver-uploader.json"))
     ap.add_argument("--sas", default=SAS, help='SDSS SAS mount (Compute Job: "/home/idies/workspace/SDSS SAS")')
+    ap.add_argument("--fragment", default="0-17",
+                    help=f"which of {N_FRAGMENTS} frame fragments to do: '0', '3-5', '0,3', '0-17' (all). "
+                         f"Each writes frame_offset_<NN>.csv; run disjoint fragments as separate jobs.")
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--out-dir", default=".")
     args = ap.parse_args()
+    frags = parse_list(args.fragment, N_FRAGMENTS)
 
     # catalog (local path or gs://)
     cpath = args.catalog
@@ -108,49 +132,52 @@ def main():
         if not os.path.exists(local):
             subprocess.run(["gcloud", "storage", "cp", cpath, local], check=True)
         cpath = local
-    cat = pd.read_parquet(cpath, columns=["idx", "objid", "run", "camcol", "field"])
-    cat = cat.sort_values("idx")
+    cat = pd.read_parquet(cpath, columns=["idx", "objid", "run", "camcol", "field"]).sort_values("idx")
 
-    # --- A1: objid -> frame ---
-    f1 = os.path.join(args.out_dir, "objid_frame.csv")
-    cat.to_csv(f1, index=False)
-    print(f"[A1] wrote {f1}  ({len(cat):,} galaxies)", flush=True)
+    # --- A1: objid -> frame (written once, by the fragment-0 job) ---
+    if 0 in frags:
+        f1 = os.path.join(args.out_dir, "objid_frame.csv")
+        cat.to_csv(f1, index=False)
+        print(f"[A1] wrote {f1}  ({len(cat):,} galaxies)", flush=True)
 
-    # --- A2: unique frame -> offset (header-only) ---
-    frames = list(map(tuple, cat[["run", "camcol", "field"]].drop_duplicates()
-                      .astype(int).itertuples(index=False, name=None)))
-    print(f"[A2] {len(frames):,} unique frames, {args.workers} workers, header-only "
-          f"(SAS={args.sas})", flush=True)
+    # unique frames, sorted (run,camcol,field) for SAS read locality, split into N_FRAGMENTS blocks
+    frames = sorted(map(tuple, cat[["run", "camcol", "field"]].drop_duplicates()
+                        .astype(int).itertuples(index=False, name=None)))
+    fblock = (len(frames) + N_FRAGMENTS - 1) // N_FRAGMENTS
+    print(f"[A2] {len(frames):,} unique frames / {N_FRAGMENTS} = ~{fblock:,} per fragment; "
+          f"doing {frags}, {args.workers} workers, header-only (SAS={args.sas})", flush=True)
 
-    rows = []; res_samples = []; done = miss = 0; t0 = last = time.time()
     with Pool(args.workers, initializer=_init, initargs=(args.sas,)) as pool:
-        for key, shifts, res in pool.imap_unordered(frame_offsets, frames, chunksize=8):
-            run, camcol, field = key
-            if shifts is None:
-                miss += 1
-                rows.append([run, camcol, field] + [np.nan] * 10)
-            else:
-                rows.append([run, camcol, field] + [v for s in shifts for v in s])
-                if not np.isnan(res):
-                    res_samples.append(res)
-            done += 1
-            now = time.time()
-            if done == 1 or now - last >= 30:
-                last = now; el = now - t0; rate = done / el if el else 0
-                eta = (len(frames) - done) / rate / 60 if rate else 0
-                print(f"[A2]   {done:,}/{len(frames):,} frames  {el:.0f}s  {rate:.1f} frm/s  "
-                      f"~{eta:.0f} min left  ({miss} unreadable)", flush=True)
-
-    cols = ["run", "camcol", "field"] + [f"{b}_{d}" for b in BANDS for d in ("dx", "dy")]
-    f2 = os.path.join(args.out_dir, "frame_offset.csv")
-    pd.DataFrame(rows, columns=cols).to_csv(f2, index=False)
-    rs = np.array(res_samples)
-    print(f"[A2] wrote {f2}  ({len(rows):,} frames, {miss} unreadable)", flush=True)
-    if len(rs):
-        print(f"[A2] per-frame-constant approx error (center->corner shift drift): "
-              f"median={np.median(rs):.2f}px  p95={np.percentile(rs,95):.2f}px  max={rs.max():.2f}px",
-              flush=True)
-    print("[done] next: Task B reads these CSVs + v1 npy from GCS -> shift -> crop24 -> v3", flush=True)
+        for fi in frags:
+            fr = frames[fi * fblock:(fi + 1) * fblock]
+            if not fr:
+                print(f"[A2] fragment {fi}: empty — skip", flush=True)
+                continue
+            rows = []; res_samples = []; done = miss = 0; t0 = last = time.time()
+            for key, shifts, res in pool.imap_unordered(frame_offsets, fr, chunksize=8):
+                run, camcol, field = key
+                if shifts is None:
+                    miss += 1; rows.append([run, camcol, field] + [np.nan] * 10)
+                else:
+                    rows.append([run, camcol, field] + [v for s in shifts for v in s])
+                    if not np.isnan(res):
+                        res_samples.append(res)
+                done += 1
+                now = time.time()
+                if done == 1 or now - last >= 30:
+                    last = now; el = now - t0; rate = done / el if el else 0
+                    eta = (len(fr) - done) / rate / 60 if rate else 0
+                    print(f"[A2 frag {fi}]  {done:,}/{len(fr):,}  {el:.0f}s  {rate:.1f} frm/s  "
+                          f"~{eta:.0f} min left  ({miss} unreadable)", flush=True)
+            fout = os.path.join(args.out_dir, f"frame_offset_{fi:02d}.csv")
+            pd.DataFrame(rows, columns=COLS).to_csv(fout, index=False)
+            rs = np.array(res_samples)
+            msg = f"[A2 frag {fi}] wrote {fout}  ({len(rows):,} frames, {miss} unreadable)"
+            if len(rs):
+                msg += (f"  | approx err: median={np.median(rs):.2f} p95={np.percentile(rs,95):.2f} "
+                        f"max={rs.max():.2f} px")
+            print(msg, flush=True)
+    print("[done] merge with merge_offsets.py, then Task B uses the merged frame_offset.csv", flush=True)
 
 
 if __name__ == "__main__":
