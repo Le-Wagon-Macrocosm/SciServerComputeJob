@@ -19,7 +19,9 @@ already-correct healthy rows, repacked from sample_v2) and overwrites ONLY the n
 rows — so shard 90's 5017 healthy rows are kept and only its 983 new rows get filled.
 Shards 91..99 start from zeros.
 
-Idempotent-ish: rerunning re-cuts and re-uploads the listed shards (always overwrites).
+Idempotent/resumable: a finished shard writes a `.done_images_XXXX_YYYY` marker on GCS and is
+SKIPPED on rerun (use --force to redo). So an interrupted job just rerun with the same --shard
+range picks up where it left off.
 
 On SciServer (container with the SDSS SAS volume mounted):
     !pip install --user astropy google-cloud-storage gcsfs pyarrow
@@ -166,6 +168,10 @@ def build_shard(args, shard, bucket, df):
         print(f"[shard {shard}] no new galaxies in idx [{lo},{hi}) — nothing to do")
         return
     blob_name = f"{args.prefix}/images_{lo:07d}_{hi:07d}.npy"
+    marker = f"{args.prefix}/.done_images_{lo:07d}_{hi:07d}"
+    if not args.force and bucket.blob(marker).exists():
+        print(f"[shard {shard}] already done (marker exists) — skip (use --force to redo)")
+        return
     osz = out_size(args.size, args.crop)
 
     # base = existing shard (keeps healthy rows already there); new rows overwritten below
@@ -216,6 +222,7 @@ def build_shard(args, shard, bucket, df):
     print(f"[shard {shard}] uploading {gb:.2f} GB -> gs://{args.bucket}/{blob_name}")
     bucket.blob(blob_name).upload_from_filename(local)
     os.remove(local)
+    bucket.blob(marker).upload_from_string(b"done")    # resume marker
     print(f"[shard {shard}] done.")
 
 
@@ -274,7 +281,8 @@ def main():
     ap.add_argument("--dtype", default="float16", choices=["float16", "float32"])
     ap.add_argument("--sas", default=SAS,
                     help=f"SDSS SAS mount (default {SAS}; Compute Job: '/home/idies/workspace/SDSS SAS')")
-    ap.add_argument("--workers", type=int, default=8, help="parallel processes")
+    ap.add_argument("--workers", type=int, default=32, help="parallel processes (default 32 = Large Job cores)")
+    ap.add_argument("--force", action="store_true", help="re-cut shards even if their .done marker exists")
     ap.add_argument("--bucket", default=DEFAULT_BUCKET)
     ap.add_argument("--prefix", default=DEFAULT_PREFIX)
     ap.add_argument("--tmp", default="/tmp")
