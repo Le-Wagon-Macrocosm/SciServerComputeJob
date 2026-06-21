@@ -5,6 +5,10 @@ SciServer batch jobs for the **Macrocosm** photo-z project. Jobs here:
 1. **Image-stamp build** (`prepare_data.py`) — cut the ugriz cutouts from the SDSS frames.
 2. **v1 → v3 registration** (`task_a_offsets.py` + `task_b_build_v3.py`) — fix the sample_v1
    band misregistration cheaply (no re-cut) and crop to 24×24.
+3. **v4 fill** (`prepare_data_v4.py`) — cut the new healthy galaxies (idx 545017..599999) that
+   refilled the quality-cleaned `catalog_v4`, 64×64 per-band registered, into `sample_v4` shards
+   90..99 (`bash run_prepare_data_v4.sh --shard 90-99 --sas "/home/idies/workspace/SDSS SAS"`).
+   sample_v4 = repack of the correctly-registered 64px `sample_v2` by the 545k survivors + these.
 3. **Outlier CV** (`outlier_cv_job.py`) — 5-fold CV on the tabular catalog to find the hard set.
 
 ---
