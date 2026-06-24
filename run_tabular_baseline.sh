@@ -18,17 +18,16 @@ echo "[run] $("$PY" --version 2>&1)  ($PY)  cwd=$HERE  cores=$(nproc 2>/dev/null
 
 echo "[run] installing deps ..."
 "$PY" -m pip install --quiet --upgrade pip 2>/dev/null || true
-"$PY" -m pip install --quiet scikit-learn pandas pyarrow joblib 2>&1 | tail -1 || \
+"$PY" -m pip install --quiet scikit-learn pandas pyarrow joblib google-cloud-storage 2>&1 | tail -1 || \
   echo "[run] pip install failed -> assuming deps already present"
 
-# catalog: local copy if present, else GCS
-CATALOG="${CATALOG:-catalog_v4.parquet}"
-GCS="gs://macrocosm-lewagon/data/sample_v4.5/catalog_v4.parquet"
+# GCS is handled inside the job via the google-cloud-storage lib (SciServer has no gcloud CLI).
+# It needs the SA key present to pull catalog/splits and upload the pkls.
 KEY="${GCS_KEY:-sciserver-uploader.json}"
-if [ ! -f "$CATALOG" ] && [[ "$CATALOG" != gs://* ]]; then
-  echo "[run] $CATALOG missing -> downloading from $GCS"
-  [ -f "$KEY" ] && gcloud auth activate-service-account --key-file "$KEY" || true
-  gcloud storage cp "$GCS" "$CATALOG"
+CATALOG="${CATALOG:-catalog_v4.parquet}"
+if [ ! -f "$CATALOG" ] && [ ! -f "$KEY" ]; then
+  echo "[run] WARNING: neither $CATALOG nor key '$KEY' found here — the job can't fetch the catalog."
+  echo "[run]          put catalog_v4.parquet and/or sciserver-uploader.json in $HERE (or set CATALOG / GCS_KEY)."
 fi
 
 echo "[run] launching tabular_baseline_job.py ..."

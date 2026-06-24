@@ -28,9 +28,11 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 
-GCS_CATALOG = "gs://macrocosm-lewagon/data/sample_v4.5/catalog_v4.parquet"
-GCS_SPLITS  = "gs://macrocosm-lewagon/data/splits"
-GCS_MODELS  = "gs://macrocosm-lewagon/models"
+# GCS via the google-cloud-storage lib + SA key (SciServer has NO gcloud CLI)
+BUCKET      = "macrocosm-lewagon"
+CAT_BLOB    = "data/sample_v4.5/catalog_v4.parquet"
+SPLITS_BLOB = "data/splits"                 # /<name>.csv
+MODELS_BLOB = "models"                      # upload base_*/meta_* here
 CATALOG = os.environ.get("CATALOG", "catalog_v4.parquet")
 GCS_KEY = os.environ.get("GCS_KEY", "sciserver-uploader.json")
 N_POOL  = int(os.environ.get("N_POOL", 300_000))
@@ -93,9 +95,13 @@ def _fit_final(X, y, rows, model):
     return mk_base(model).fit(X[rows], y[rows])
 
 
-def get_csv(local, gcs):
+def _bucket():
+    from google.cloud import storage
+    return storage.Client.from_service_account_json(GCS_KEY).bucket(BUCKET)
+
+def get_csv(local, blob):
     if not os.path.exists(local):
-        subprocess.run(["gcloud", "storage", "cp", gcs, local], check=True)
+        _bucket().blob(blob).download_to_filename(local)
     return pd.read_csv(local)
 
 
@@ -104,15 +110,14 @@ def main():
     os.makedirs(OUTDIR, exist_ok=True)
     print(f"[job] {'SMOKE ' if SMOKE else ''}cores={CORES} N_POOL={N_POOL}", flush=True)
 
-    # catalog + splits
-    if not CATALOG.startswith("gs://") and not os.path.exists(CATALOG):
-        if os.path.exists(GCS_KEY):
-            subprocess.run(["gcloud", "auth", "activate-service-account", "--key-file", GCS_KEY], check=False)
-        subprocess.run(["gcloud", "storage", "cp", GCS_CATALOG, CATALOG], check=True)
+    # catalog + splits (pull from GCS via the lib if not already local)
+    if not os.path.exists(CATALOG):
+        print(f"[job] {CATALOG} missing -> downloading gs://{BUCKET}/{CAT_BLOB}", flush=True)
+        _bucket().blob(CAT_BLOB).download_to_filename(CATALOG)
     cat = pd.read_parquet(CATALOG)
     objid = cat["objid"].to_numpy("int64"); z = cat["redshift"].to_numpy("float64")
-    train_ids = set(get_csv("train_objids.csv", f"{GCS_SPLITS}/train_objids.csv")["objid"].astype("int64"))
-    val_ids   = set(get_csv("val_objids.csv",   f"{GCS_SPLITS}/val_objids.csv")["objid"].astype("int64"))
+    train_ids = set(get_csv("train_objids.csv", f"{SPLITS_BLOB}/train_objids.csv")["objid"].astype("int64"))
+    val_ids   = set(get_csv("val_objids.csv",   f"{SPLITS_BLOB}/val_objids.csv")["objid"].astype("int64"))
     is_tr, is_va = np.isin(objid, list(train_ids)), np.isin(objid, list(val_ids))
     print(f"[job] catalog {len(cat):,} | train {is_tr.sum():,} | val {is_va.sum():,}  ({time.time()-t0:.0f}s)", flush=True)
 
@@ -193,11 +198,17 @@ def main():
     with tarfile.open(tar, "w:gz") as t: t.add(OUTDIR, arcname=os.path.basename(OUTDIR))
     print(f"[job] wrote {tar}", flush=True)
 
-    # upload the pkls to GCS so the Colab fusion notebooks can pull them
+    # upload the pkls to GCS (via the lib) so the Colab fusion notebooks can pull them
     if not SMOKE and os.path.exists(GCS_KEY):
-        subprocess.run(["gcloud", "auth", "activate-service-account", "--key-file", GCS_KEY], check=False)
-        subprocess.run(["gcloud", "storage", "cp", f"{OUTDIR}/base_*.pkl", f"{OUTDIR}/meta_*.pkl", f"{GCS_MODELS}/"], check=False)
-        print(f"[job] uploaded base_*/meta_* pkls -> {GCS_MODELS}/", flush=True)
+        try:
+            b = _bucket()
+            for k in SETS:
+                for m in ORDER:
+                    b.blob(f"{MODELS_BLOB}/base_{k}_{m}.pkl").upload_from_filename(f"{OUTDIR}/base_{k}_{m}.pkl")
+                b.blob(f"{MODELS_BLOB}/meta_{k}.pkl").upload_from_filename(f"{OUTDIR}/meta_{k}.pkl")
+            print(f"[job] uploaded base_*/meta_* pkls -> gs://{BUCKET}/{MODELS_BLOB}/", flush=True)
+        except Exception as e:
+            print(f"[job] GCS upload failed ({e}); the local tar still has everything", flush=True)
 
     print(f"[job] DONE total {time.time()-t0:.0f}s", flush=True)
 
