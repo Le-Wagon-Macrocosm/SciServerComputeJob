@@ -108,7 +108,7 @@ def chunk_task(path, is_mlp, Xc, bg, ckpt):
 def save_outputs(key, title, feats, coef, sv_total, xe):
     """Write everything for one model: md table, json numbers, npz raw values, bar + beeswarm png."""
     imp = np.abs(sv_total).mean(0)
-    o = np.argsort(imp)[::-1]; tot = imp.sum() + 1e-12
+    o = np.argsort(imp)[::-1]; tot = float(imp.sum() + 1e-12)  # Python float -> json-safe pct/group_pct
     rows = [(feats[i], group(feats[i]), float(imp[i]), 100*imp[i]/tot) for i in o]
     gt = {}
     for _, g, v, _ in rows: gt[g] = gt.get(g, 0.0) + v
