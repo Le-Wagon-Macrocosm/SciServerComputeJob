@@ -14,7 +14,7 @@ echo "[run] $("$PY" --version 2>&1)  cores=$(nproc 2>/dev/null || echo '?')  arg
 
 echo "[run] installing deps ..."
 "$PY" -m pip install --quiet --upgrade pip 2>/dev/null || true
-"$PY" -m pip install --quiet shap scikit-learn pandas pyarrow joblib matplotlib google-cloud-storage 2>&1 | tail -1 || \
+"$PY" -m pip install --quiet shap "scikit-learn==1.9.0" pandas pyarrow joblib matplotlib google-cloud-storage 2>&1 | tail -1 || \
   echo "[run] pip install failed -> assuming deps already present"
 
 KEY="${GCS_KEY:-sciserver-uploader.json}"

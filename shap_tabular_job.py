@@ -15,7 +15,7 @@ Pulls catalog_v4 + the model pkls from GCS (google-cloud-storage lib + sciserver
 
 env:  CATALOG=...  N_EXPLAIN=400  N_BG=50  CORES=<n>  GCS_KEY=sciserver-uploader.json   smoke: --smoke
 """
-import os, sys, time, json, glob, tarfile
+import os, sys, time, json, glob, copy, tarfile
 import numpy as np, pandas as pd, joblib, shap
 from joblib import Parallel, delayed
 import matplotlib; matplotlib.use("Agg")
@@ -35,6 +35,7 @@ OUTDIR = "shap_out_smoke" if SMOKE else "shap_out"      # smoke kept separate so
 N_EXPLAIN = int(os.environ.get("N_EXPLAIN", 40 if SMOKE else 400))
 N_BG = int(os.environ.get("N_BG", 30 if SMOKE else 50))
 CHUNK_ROWS = int(os.environ.get("CHUNK_ROWS", 8 if SMOKE else 10))   # rows per checkpointed SHAP chunk
+N_TREES_SHAP = int(os.environ.get("N_TREES_SHAP", 30))   # explain a sub-forest of the RF (TreeExplainer mem ~ #trees)
 
 MODELS = {
     "16feat": dict(title="16-feat v4 baseline stack", bundle="baseline_stack_v4.pkl"),
@@ -86,6 +87,10 @@ _EXP = {}
 def _explainer(path, is_mlp):
     if path not in _EXP:
         a = joblib.load(path); est = a["model"] if isinstance(a, dict) and "model" in a else a
+        # RFs are huge & deep -> TreeExplainer would OOM. Explain a sub-forest (importance ranking is
+        # stable since the RF averages its trees); HGB/MLP untouched.
+        if not is_mlp and hasattr(est, "estimators_") and len(getattr(est, "estimators_", [])) > N_TREES_SHAP:
+            est = copy.copy(est); est.estimators_ = est.estimators_[:N_TREES_SHAP]; est.n_estimators = N_TREES_SHAP
         _EXP[path] = (None if is_mlp else shap.TreeExplainer(est), est)
     return _EXP[path]
 
