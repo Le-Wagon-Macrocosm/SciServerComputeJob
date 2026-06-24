@@ -32,7 +32,7 @@ if [ ! -f "$CATALOG" ] && [[ "$CATALOG" != gs://* ]]; then
 fi
 
 echo "[run] launching tabular_baseline_job.py ..."
-"$PY" tabular_baseline_job.py "$@"
+PYTHONUNBUFFERED=1 "$PY" -u tabular_baseline_job.py "$@"   # -u + flush=True => real-time progress in the job log
 status=$?
 
 echo "[run] exit=$status  artifacts:"
