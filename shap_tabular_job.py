@@ -15,11 +15,12 @@ Pulls catalog_v4 + the model pkls from GCS (google-cloud-storage lib + sciserver
 
 env:  CATALOG=...  N_EXPLAIN=400  N_BG=50  CORES=<n>  GCS_KEY=sciserver-uploader.json   smoke: --smoke
 """
-import os, sys, time, json, tarfile
+import os, sys, time, json, glob, tarfile
 import numpy as np, pandas as pd, joblib, shap
 from joblib import Parallel, delayed
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from joblib.externals.loky import get_reusable_executor
 
 BUCKET = "macrocosm-lewagon"
 CAT_BLOB = "data/sample_v4.5/catalog_v4.parquet"
@@ -28,11 +29,12 @@ RESULTS_BLOB = "results/shap"
 CATALOG = os.environ.get("CATALOG", "catalog_v4.parquet")
 GCS_KEY = os.environ.get("GCS_KEY", "sciserver-uploader.json")
 CORES = int(os.environ.get("CORES", os.cpu_count() or 8))
-OUTDIR = "shap_out"
 ORDER = ["RF", "HGB", "MLP"]
 SMOKE = ("--smoke" in sys.argv) or bool(os.environ.get("SMOKE"))
+OUTDIR = "shap_out_smoke" if SMOKE else "shap_out"      # smoke kept separate so it can't fake "done" on a real run
 N_EXPLAIN = int(os.environ.get("N_EXPLAIN", 40 if SMOKE else 400))
 N_BG = int(os.environ.get("N_BG", 30 if SMOKE else 50))
+CHUNK_ROWS = int(os.environ.get("CHUNK_ROWS", 8 if SMOKE else 10))   # rows per checkpointed SHAP chunk
 
 MODELS = {
     "16feat": dict(title="16-feat v4 baseline stack", bundle="baseline_stack_v4.pkl"),
@@ -87,11 +89,15 @@ def _explainer(path, is_mlp):
         _EXP[path] = (None if is_mlp else shap.TreeExplainer(est), est)
     return _EXP[path]
 
-def shap_chunk(path, is_mlp, Xc, bg):
+def chunk_task(path, is_mlp, Xc, bg, ckpt):
+    """SHAP for one small slice of explained rows -> save to ckpt npy. Skips if already computed
+    (so a re-run after a time-limit kill reuses every finished chunk)."""
+    if os.path.exists(ckpt):
+        return
     exp, est = _explainer(path, is_mlp)
-    if is_mlp:
-        return np.asarray(shap.PermutationExplainer(est.predict, bg)(Xc).values)
-    return np.asarray(exp.shap_values(Xc, check_additivity=False))
+    vals = (shap.PermutationExplainer(est.predict, bg)(Xc).values if is_mlp
+            else exp.shap_values(Xc, check_additivity=False))
+    np.save(ckpt, np.asarray(vals, "float32"))
 
 
 def save_outputs(key, title, feats, coef, sv_total, xe):
@@ -173,19 +179,37 @@ def main():
         print(f"[job] {key}: {len(resolved[key]['feats'])} feats", flush=True)
 
     for key, R in resolved.items():
+        if os.path.exists(f"{OUTDIR}/shap_{key}.json"):          # model already finished on a prior run
+            print(f"[job] {key}: already done -> skip", flush=True); continue
         tk = time.time(); feats = R["feats"]; X = feature_frame(cat, feats)
         keep = np.where(~np.isnan(X).any(1))[0]
-        rng = np.random.RandomState(0); rng.shuffle(keep)
+        np.random.RandomState(0).shuffle(keep)                  # deterministic -> chunk ckpts align across runs
         bg = X[keep[:N_BG]]; xe = X[keep[N_BG:N_BG+N_EXPLAIN]]
-        chunks = [c for c in np.array_split(np.arange(len(xe)), CORES) if len(c)]
-        tasks = [(m, m == "MLP", R["paths"][m], ci) for m in ORDER for ci in range(len(chunks))]
-        res = Parallel(n_jobs=CORES, backend="loky", verbose=5)(
-            delayed(shap_chunk)(R["paths"][m], is_mlp, xe[chunks[ci]], bg) for (m, is_mlp, _, ci) in tasks)
-        svb = {m: np.zeros((len(xe), len(feats))) for m in ORDER}
-        for (m, _, _, ci), vals in zip(tasks, res): svb[m][chunks[ci]] = vals
+        nch = max(CORES, int(np.ceil(len(xe)/CHUNK_ROWS)))
+        slices = [s for s in np.array_split(np.arange(len(xe)), nch) if len(s)]
+        svb = {}
+        for m in ORDER:                                         # one base at a time -> only its RF in workers
+            is_mlp = (m == "MLP")
+            Parallel(n_jobs=CORES, backend="loky", verbose=5)(
+                delayed(chunk_task)(R["paths"][m], is_mlp, xe[sl], bg, f"{OUTDIR}/_ck_{key}_{m}_{ci}.npy")
+                for ci, sl in enumerate(slices))
+            sv = np.zeros((len(xe), len(feats)), "float32")
+            for ci, sl in enumerate(slices): sv[sl] = np.load(f"{OUTDIR}/_ck_{key}_{m}_{ci}.npy")
+            svb[m] = sv
+            get_reusable_executor().shutdown(wait=True)         # release this base's RF before the next
+            print(f"[job] {key}/{m} chunks done ({time.time()-tk:.0f}s)", flush=True)
         w = dict(zip(ORDER, [float(c) for c in R["coef"]]))
         sv_total = sum(w[m] * svb[m] for m in ORDER)
         top = save_outputs(key, R["title"], feats, R["coef"], sv_total, xe)
+        for f in glob.glob(f"{OUTDIR}/_ck_{key}_*.npy"): os.remove(f)   # drop chunk ckpts (model is done)
+        if not SMOKE and os.path.exists(GCS_KEY):               # push this finished model to gs immediately
+            try:
+                b = _bucket()
+                for fn in glob.glob(f"{OUTDIR}/shap_{key}*"):
+                    b.blob(f"{RESULTS_BLOB}/{os.path.basename(fn)}").upload_from_filename(fn)
+                print(f"[job] {key} uploaded -> gs://{BUCKET}/{RESULTS_BLOB}/", flush=True)
+            except Exception as e:
+                print(f"[job] {key} upload skipped ({e})", flush=True)
         print(f"[job] {key} done ({time.time()-tk:.0f}s) | top: " + ", ".join(f"{n}({p:.0f}%)" for n,_,_,p in top), flush=True)
 
     tar = "shap_tabular_results_smoke.tar.gz" if SMOKE else "shap_tabular_results.tar.gz"
